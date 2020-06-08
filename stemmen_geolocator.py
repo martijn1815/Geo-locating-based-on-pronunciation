@@ -11,13 +11,14 @@ import pickle
 import random
 import operator
 import librosa
-from numba import np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 from collections import defaultdict
 from statistics import mean
+from combinations import get_combinations
+from sklearn.metrics import precision_recall_fscore_support
 
 
 def parse_arguments():
@@ -42,11 +43,12 @@ def parse_arguments():
     # test compatibility of parameters
     if args.develop and args.test:
         raise RuntimeError("-develop and -test can not be called at the same time.")
-    if args.develop and args.develop not in ["RandomForest", "LinearSVM", "SVM", "KNN", "ALL"]:
-        raise RuntimeError("Classifier not implemented, choose RandomForest, LinearSVM, SVM or KNN.")
-    if args.test and args.test not in ["RandomForest", "LinearSVM", "SVM", "KNN"]:
-        raise RuntimeError("Classifier not implemented, choose RandomForest, LinearSVM, SVM or KNN.")
-
+    if args.develop and args.develop not in ["RandomForest", "LinearSVM", "SVM", "KNN", "ALL", "FEATUREGRID"]:
+        raise RuntimeError("Classifier {0} not implemented, "
+                           "choose RandomForest, LinearSVM, SVM or KNN.".format(args.develop))
+    if args.test and args.test not in ["RandomForest", "LinearSVM", "SVM", "KNN", "ALL"]:
+        raise RuntimeError("Classifier {0} not implemented, "
+                           "choose RandomForest, LinearSVM, SVM or KNN.".format(args.test))
     return args
 
 
@@ -171,9 +173,10 @@ def add_spectral_features(data):
 
             spectral_features["spectral_centroid"] = mean(librosa.feature.spectral_centroid(y=y, sr=sr)[0])
             spectral_features["spectral_bandwidth"] = mean(librosa.feature.spectral_bandwidth(y=y, sr=sr)[0])
-            #spectral_features["rms"] = mean(librosa.feature.rms(y=y)[0])
-            #spectral_features["spectral_rolloff"] = mean(librosa.feature.spectral_rolloff(y=y, sr=sr)[0])
+            spectral_features["spectral_rolloff_max"] = mean(librosa.feature.spectral_rolloff(y=y, sr=sr)[0])
+            spectral_features["spectral_rolloff_min"] = mean(librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.1)[0])
             spectral_features["zero_crossing_rate"] = mean(librosa.feature.zero_crossing_rate(y=y)[0])
+            spectral_features["rms"] = mean(librosa.feature.rms(y=y)[0])
 
             chroma_stft = librosa.feature.chroma_stft(y=y, sr=sr)
             spectral_features["chroma_stft"] = list()
@@ -185,9 +188,6 @@ def add_spectral_features(data):
             for e in mfcc:
                 spectral_features["mfcc"].append(mean(e))
 
-            tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-            spectral_features["tempo"] = tempo
-
             #print(spectral_features)
 
             data[sessionID]['words'][word]["spectral_features"] = spectral_features
@@ -195,7 +195,30 @@ def add_spectral_features(data):
     return data
 
 
-def get_feats_train(data, seperate=True, encoded=True, spectral=True):
+def get_feature_grid_dict(features):
+    return {"municipality": {"RandomForest": features,
+                             "LinearSVM": features,
+                             "SVM": features,
+                             "KNN": features},
+            "province": {"RandomForest": features,
+                         "LinearSVM": features,
+                         "SVM": features,
+                         "KNN": features}}
+
+
+def get_feature_dict(test=False):
+    return {"municipality": {"RandomForest": ["spectral_centroid", "mfcc", "rms"],
+                             "LinearSVM": ["chroma_stft", "zero_crossing_rate"],
+                             "SVM": ["spectral_bandwidth", "mfcc", "chroma_stft", "zero_crossing_rate"],
+                             "KNN": ["spectral_rolloff_max", "mfcc", "zero_crossing_rate"]},
+            "province": {"RandomForest": ["spectral_rolloff_min", "mfcc"],
+                         "LinearSVM": ["spectral_rolloff_min", "mfcc", "chroma_stft"],
+                         "SVM": ["mfcc", "zero_crossing_rate"],
+                         "KNN": ["chroma_stft", "zero_crossing_rate", "rms"]}}
+
+
+def get_feats_train(data, location_lvl, classifier,
+                    seperate=True, encoded=True, spectral=True, apply_feature=None):
     """
     Returns features-list and labels-list for municipalities and provinces
     :param data:                                dict
@@ -206,8 +229,10 @@ def get_feats_train(data, seperate=True, encoded=True, spectral=True):
     """
 
     feats = list()
-    municipalities = list()
-    provinces = list()
+    tags = list()
+
+    if apply_feature == None:
+        apply_feature = get_feature_dict()
 
     for sessionID in data:
         words_array = list()
@@ -220,24 +245,23 @@ def get_feats_train(data, seperate=True, encoded=True, spectral=True):
             spectral_features = list()
             if spectral:
                 for sf in data[sessionID]['words'][word]["spectral_features"]:
-                    if isinstance(data[sessionID]['words'][word]["spectral_features"][sf], list):
-                        spectral_features += data[sessionID]['words'][word]["spectral_features"][sf]
-                    else:
-                        spectral_features.append(data[sessionID]['words'][word]["spectral_features"][sf])
+                    if sf in apply_feature[location_lvl][classifier]:
+                        if isinstance(data[sessionID]['words'][word]["spectral_features"][sf], list):
+                            spectral_features += data[sessionID]['words'][word]["spectral_features"][sf]
+                        else:
+                            spectral_features.append(data[sessionID]['words'][word]["spectral_features"][sf])
 
             if seperate:
                 feats.append(word_feat + spectral_features)
-                municipalities.append(data[sessionID]['municipality'])
-                provinces.append(data[sessionID]['province'])
+                tags.append(data[sessionID][location_lvl])
             else:
                 words_array += word_feat + spectral_features
 
         if not seperate:
             feats.append(words_array)
-            municipalities.append(data[sessionID]['municipality'])
-            provinces.append(data[sessionID]['province'])
+            tags.append(data[sessionID][location_lvl])
 
-    return feats, municipalities, provinces
+    return feats, tags
 
 
 def get_folds(data, folds=10):
@@ -330,7 +354,8 @@ def majority_vote(list):
     return max(dict.items(), key=operator.itemgetter(1))[0]
 
 
-def classifier_predict(data, classifier, location_lvl, encoded=True, spectral=True):
+def classifier_predict(data, classifier, classifier_selected, location_lvl,
+                       encoded=True, spectral=True, apply_feature=None):
     """
     Predicts location label for given location level (municipality or province)
     and appends the predicted label to the data dictionary in the following structure:
@@ -363,6 +388,9 @@ def classifier_predict(data, classifier, location_lvl, encoded=True, spectral=Tr
     :return data:           dict
     """
 
+    if apply_feature == None:
+        apply_feature = get_feature_dict()
+
     for sessionID in data:
         x = list()
         for word in data[sessionID]['words']:
@@ -374,10 +402,11 @@ def classifier_predict(data, classifier, location_lvl, encoded=True, spectral=Tr
             spectral_features = list()
             if spectral:
                 for sf in data[sessionID]['words'][word]["spectral_features"]:
-                    if isinstance(data[sessionID]['words'][word]["spectral_features"][sf], list):
-                        spectral_features += data[sessionID]['words'][word]["spectral_features"][sf]
-                    else:
-                        spectral_features.append(data[sessionID]['words'][word]["spectral_features"][sf])
+                    if sf in apply_feature[location_lvl][classifier_selected]:
+                        if isinstance(data[sessionID]['words'][word]["spectral_features"][sf], list):
+                            spectral_features += data[sessionID]['words'][word]["spectral_features"][sf]
+                        else:
+                            spectral_features.append(data[sessionID]['words'][word]["spectral_features"][sf])
 
             x.append(word_feat + spectral_features)
         predicted = classifier.predict(x)
@@ -396,17 +425,26 @@ def get_accuracy(data, location_lvl):
     """
 
     total = 0
-    true = 0
+    tp = 0
+    y_true = list()
+    y_pred = list()
     for sessionID in data:
+        y_true.append(data[sessionID][location_lvl])
+        y_pred.append(data[sessionID]["prediction_{0}".format(location_lvl)])
         if data[sessionID][location_lvl] == data[sessionID]["prediction_{0}".format(location_lvl)]:
-            true += 1
+            tp += 1
         total += 1
 
-    return float(true/total)
+    return [float(tp/total),
+            precision_recall_fscore_support(y_true, y_pred, average='macro'),
+            precision_recall_fscore_support(y_true, y_pred, average='micro')]
 
 
-def develop(classifier, data=None, fold_info=True):
-    print("### Classifier: {}".format(classifier))
+def develop(classifier, data=None, fold_info=True, feature_dict=None):
+
+    if feature_dict == None:
+        print("### Classifier: {}".format(classifier))
+
     if not data:
         data = load_pickle("stemmen_train")
         print("## Amount of participants: {}".format(len(data)))
@@ -423,62 +461,99 @@ def develop(classifier, data=None, fold_info=True):
         if fold_info: print("## Fold {0}".format(i + 1))
 
         if fold_info: print("# Training classifier:", end=" ")
-        train_feats, train_municipalities, train_provinces = get_feats_train(train_dict)
+        train_feats_municipality, train_municipalities = get_feats_train(train_dict, "municipality", classifier,
+                                                                         apply_feature=feature_dict)
+        train_feats_province, train_provinces = get_feats_train(train_dict, "province", classifier,
+                                                                apply_feature=feature_dict)
         if fold_info: print("Done")
 
         municipality_classifier = train_classifier(train_dict,
-                                                   train_feats,
+                                                   train_feats_municipality,
                                                    train_municipalities,
                                                    "municipality",
                                                    classifier=classifier)
         province_classifier = train_classifier(train_dict,
-                                               train_feats,
+                                               train_feats_province,
                                                train_provinces,
                                                "province",
                                                classifier=classifier)
 
-        test_dict = classifier_predict(test_dict, municipality_classifier, "municipality")
-        test_dict = classifier_predict(test_dict, province_classifier, "province")
+        test_dict = classifier_predict(test_dict, municipality_classifier, classifier, "municipality",
+                                       apply_feature=feature_dict)
+        test_dict = classifier_predict(test_dict, province_classifier, classifier, "province",
+                                       apply_feature=feature_dict)
 
-        accuracy_list_muni.append(get_accuracy(test_dict, "municipality"))
+        accuracy_list_muni.append(get_accuracy(test_dict, "municipality")[0])
         if fold_info: print("Accuracy municipalities: {0}".format(accuracy_list_muni[-1]))
-        accuracy_list_prov.append(get_accuracy(test_dict, "province"))
+        
+        accuracy_list_prov.append(get_accuracy(test_dict, "province")[0])
         if fold_info: print("Accuracy provinces: {0}\n".format(accuracy_list_prov[-1]))
 
-    print("Mean accuracy municipalities: {0}".format(sum(accuracy_list_muni) / len(accuracy_list_muni)))
-    print("Mean accuracy provinces: {0}\n".format(sum(accuracy_list_prov) / len(accuracy_list_prov)))
+    if feature_dict == None:
+        print("Mean accuracy municipalities: {0}".format(sum(accuracy_list_muni) / len(accuracy_list_muni)))
+        print("Mean accuracy provinces: {0}\n".format(sum(accuracy_list_prov) / len(accuracy_list_prov)))
+    else:
+        print("{0:.4f}\t{1:.4f}".format(sum(accuracy_list_muni) / len(accuracy_list_muni), sum(accuracy_list_prov) / len(accuracy_list_prov)), end="\t")
 
 
-def test(classifier):
-    train_data = load_pickle("stemmen_train")
-    encode_dict = get_encode_dict(train_data)
-    train_data = add_encoded_word(train_data, encode_dict)
-    train_data = add_spectral_features(train_data)
+def test(classifier, train_data=None, test_data=None):
+    print("### Classifier: {}".format(classifier))
 
-    test_data = load_pickle("stemmen_test")
-    test_data = add_encoded_word(test_data, encode_dict)
-    test_data = add_spectral_features(test_data)
+    if not train_data or not test_data:
+        encode_dict = get_encode_dict(train_data)
+
+    if not train_data:
+        train_data = load_pickle("stemmen_train")
+        train_data = add_encoded_word(train_data, encode_dict)
+        train_data = add_spectral_features(train_data)
+
+    if not test_data:
+        test_data = load_pickle("stemmen_test")
+        test_data = add_encoded_word(test_data, encode_dict)
+        test_data = add_spectral_features(test_data)
+
+    if not train_data and not test_data:
+        print("# Get spectral features:", end=" ")
+
+    if not train_data:
+        train_data = add_spectral_features(train_data)
+
+    if not test_data:
+        test_data = add_spectral_features(test_data)
+
+    if not train_data and not test_data:
+        print("Done\n")
 
     print("# Training Classifier:", end=" ")
-    train_feats, train_municipalities, train_provinces = get_feats_train(train_data)
-    print("Done")
+    train_feats_municipality, train_municipalities = get_feats_train(train_data, "municipality", classifier)
+    train_feats_province, train_provinces = get_feats_train(train_data, "province", classifier)
 
     municipality_classifier = train_classifier(train_data,
-                                               train_feats,
+                                               train_feats_municipality,
                                                train_municipalities,
                                                "municipality",
                                                classifier=classifier)
     province_classifier = train_classifier(train_data,
-                                           train_feats,
+                                           train_feats_province,
                                            train_provinces,
                                            "province",
                                            classifier=classifier)
+    print("Done")
 
-    test_data = classifier_predict(test_data, municipality_classifier, "municipality")
-    test_data = classifier_predict(test_data, province_classifier, "province")
+    test_data = classifier_predict(test_data, municipality_classifier, classifier, "municipality")
+    test_data = classifier_predict(test_data, province_classifier, classifier, "province")
 
-    print("Accuracy municipalities: {0}".format(get_accuracy(test_data, "municipality")))
-    print("Accuracy provinces: {0}\n".format(get_accuracy(test_data, "province")))
+    acc_mun = get_accuracy(test_data, "municipality")
+    print("Accuracy municipalities: {0}".format(acc_mun[0]))
+    print("Precision municipalities: {0}".format(acc_mun[1][0]))
+    print("Recall municipalities: {0}".format(acc_mun[1][1]))
+    print("F-score municipalities: {0}\n".format(2*(acc_mun[1][0]*acc_mun[1][1])/(acc_mun[1][0]+acc_mun[1][1])))
+
+    acc_prov = get_accuracy(test_data, "province")
+    print("Accuracy provinces: {0}".format(acc_prov[0]))
+    print("Precision provinces: {0}".format(acc_prov[1][0]))
+    print("Recall provinces: {0}".format(acc_prov[1][1]))
+    print("F-score provinces: {0}\n".format(2 * (acc_prov[1][0] * acc_prov[1][1]) / (acc_prov[1][0] + acc_prov[1][1])))
 
 
 if __name__ == "__main__":
@@ -486,18 +561,77 @@ if __name__ == "__main__":
     if args.develop:
         if args.develop == "ALL":
             print("### Running all classifiers")
+
             data = load_pickle("stemmen_train")
             print("## Amount of participants: {}".format(len(data)))
+
             encode_dict = get_encode_dict(data)
             data = add_encoded_word(data, encode_dict)
+
             print("# Get spectral features:", end=" ")
             data = add_spectral_features(data)
             print("Done\n")
+
             for classifier in ["RandomForest", "LinearSVM", "SVM", "KNN"]:
                 develop(classifier, data=data, fold_info=False)
+
+        elif args.develop == "FEATUREGRID":
+            print("### Running all classifiers")
+
+            data = load_pickle("stemmen_train")
+            print("## Amount of participants: {}".format(len(data)))
+
+            encode_dict = get_encode_dict(data)
+            data = add_encoded_word(data, encode_dict)
+
+            print("# Get spectral features:", end=" ")
+            data = add_spectral_features(data)
+            print("Done\n")
+
+            dict = {"spectral_rolloff_max": "Max frequency", "spectral_rolloff_min": "Min frequency",
+                    "spectral_bandwidth": "Bandwidth", "spectral_centroid": "Centroid", "mfcc": "MFCC",
+                    "chroma_stft": "Chroma", "zero_crossing_rate": "Zero crossing rate", "rms": "RMS"}
+            combinations = get_combinations()
+            for comb in combinations:
+                print(", ".join([dict[c] for c in comb]), end="\t")
+                features = get_feature_grid_dict(comb)
+                for classifier in ["RandomForest", "LinearSVM", "SVM", "KNN"]:
+                    develop(classifier, data=data, fold_info=False, feature_dict=features)
+                print()
+
         else:
             develop(args.develop)
+
     elif args.test:
-        test(args.test)
+        if args.test == "ALL":
+            print("### Running all classifiers")
+
+            train_data = load_pickle("stemmen_train")
+            test_data = load_pickle("stemmen_test")
+
+            print("## Amount of participants: {}".format(len(train_data) + len(test_data)))
+            print("## Amount of train participants: {}".format(len(train_data)))
+            print("## Amount of test participants: {}".format(len(test_data)))
+
+            encode_dict = get_encode_dict(train_data)
+
+            train_data = add_encoded_word(train_data, encode_dict)
+            train_data = add_spectral_features(train_data)
+
+            test_data = add_encoded_word(test_data, encode_dict)
+            test_data = add_spectral_features(test_data)
+
+            print("# Get spectral features:", end=" ")
+            train_data = add_spectral_features(train_data)
+            test_data = add_spectral_features(test_data)
+            print("Done\n")
+
+            for classifier in ["RandomForest", "LinearSVM", "SVM", "KNN"]:
+                test(classifier, train_data=train_data, test_data=test_data)
+
+        else:
+            print("### Classifier: {}".format(args.test))
+            test(args.test)
+
     else:
         print("No parameters given. Use '-h' for help.")
